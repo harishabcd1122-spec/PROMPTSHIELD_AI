@@ -54,7 +54,7 @@ def preprocess_prompt(prompt: str) -> str:
     """Perform basic normalization for classification while preserving original text."""
     if not prompt or not isinstance(prompt, str):
         return ""
-    return prompt.strip().lower()
+    return " ".join(prompt.strip().lower().split())
 
 
 # --------------------------------------------------------------------
@@ -66,6 +66,24 @@ def check_security_rules(prompt: str) -> dict:
     Uses case-insensitive pattern matching to catch obvious attack vectors.
     """
     normalized = prompt.lower()
+
+    harmful_intent_patterns = [
+        r"\bhow to\b.*\b(hijack|harass|threaten|stalk|intimidate|abduct|attack|kill|harm|hurt)\b.*\b(someone|person|girl|school|another person)\b",
+        r"\bhow can i\b.*\b(hijack|harass|threaten|stalk|intimidate|abduct|attack|kill|harm|hurt)\b.*\b(someone|person|girl|another person)\b",
+        r"\bhow do i\b.*\b(hijack|harass|threaten|stalk|intimidate|abduct|attack|kill|harm|hurt)\b.*\b(someone|person|girl|another person)\b",
+        r"\b(tell me how|what is the best way|how would i)\b.*\b(hijack|harass|threaten|stalk|intimidate|abduct|attack|kill|harm|hurt)\b.*\b(someone|person|girl|another person)\b",
+        r"\b(i want to|i plan to|i intend to|i am planning to)\b.*\b(hijack|harass|threaten|stalk|intimidate|abduct|attack|kill|harm|hurt)\b.*\b(someone|person|girl|another person)\b",
+    ]
+
+    for pattern in harmful_intent_patterns:
+        if re.search(pattern, normalized):
+            return {
+                "matched": True,
+                "category": "Unsafe Instructions",
+                "pattern": "explicit person-directed harmful intent",
+                "reason": "Prompt expresses harmful intent toward a person or group.",
+                "indicator": "Person-directed harmful intent detected",
+            }
 
     # Rule definitions grouped by threat category
     rules = [
@@ -136,6 +154,12 @@ def check_security_rules(prompt: str) -> dict:
                 "reveal your hidden",
                 "show me your hidden",
                 "show system prompt",
+                "show me the system prompt",
+                "show the system prompt",
+                "print the system prompt",
+                "display the system prompt",
+                "provide the system prompt",
+                "return the system prompt",
                 "exact system prompt",
                 "print your environment variables",
                 "aws_secret_access_key",
@@ -283,51 +307,108 @@ def get_security_indicator(category: str, rule_match: dict) -> str:
 
 
 # --------------------------------------------------------------------
-# 6. Top Indicators (Lightweight Feature-Importance)
+# 6. Top Indicators (TF-IDF Feature Contributions)
 # --------------------------------------------------------------------
-def get_top_indicators(prompt: str, predicted_category: str) -> list:
-    """
-    Identify up to 5 words from the submitted prompt that most influenced
-    the Logistic Regression prediction for the given category.
+INDICATOR_STOP_WORDS = {
+    "how", "what", "why", "when", "where", "who", "which", "to", "a", "an", "the",
+    "is", "are", "was", "were", "am", "be", "been", "being", "can", "could", "would",
+    "should", "will", "may", "might", "do", "does", "did", "i", "me", "my", "you",
+    "your", "we", "our", "they", "their", "it", "this", "that", "these", "those", "for",
+    "of", "in", "on", "at", "by", "with", "from", "about", "as", "and", "or", "but", "if",
+    "then", "than", "please", "tell", "give", "show", "explain", "describe", "help", "want",
+    "need", "like", "mean", "means", "used", "use", "act", "all", "no", "without"
+}
 
-    Uses the model's feature coefficients and the TF-IDF vocabulary.
-    Only returns words actually present in the submitted prompt.
-    Returns an empty list if no meaningful indicators can be identified.
+
+def _meaningful_indicator(feature: str) -> bool:
+    """Return whether a TF-IDF feature contains useful prompt context."""
+    words = feature.lower().split()
+    return bool(words) and any(word not in INDICATOR_STOP_WORDS for word in words)
+
+
+def _indicator_words(value: str) -> set[str]:
+    """Tokenize an indicator for duplicate and phrase-overlap checks."""
+    return set(re.findall(r"[a-z][a-z']{1,}", value.lower()))
+
+
+def has_meaningful_prompt_content(prompt: str) -> bool:
+    """Identify whether a prompt has content beyond generic request language."""
+    tokens = re.findall(r"[a-z][a-z']{1,}", prompt.lower())
+    return any(token not in INDICATOR_STOP_WORDS and len(token) >= 3 for token in tokens)
+
+
+def get_top_indicators(prompt: str, predicted_category: str, rule_match: dict | None = None) -> list:
+    """Return meaningful in-prompt indicators ranked by model contribution.
+
+    Active TF-IDF unigrams, bigrams, and trigrams are scored as
+    ``tfidf_value * class_coefficient``. Positive contributions are preferred;
+    filtered prompt terms provide a conservative fallback for unseen words.
     """
-    if model is None or vectorizer is None:
+    if not prompt or predicted_category == "Safe Prompt":
         return []
 
-    try:
-        classes = list(model.classes_)
-        if predicted_category not in classes:
-            return []
+    prompt_tokens = re.findall(r"[a-z][a-z']{1,}", prompt.lower())
+    prompt_token_set = set(prompt_tokens)
+    candidates = []
 
-        class_idx = classes.index(predicted_category)
-        coefficients = model.coef_[class_idx]
+    if model is not None and vectorizer is not None:
+        try:
+            classes = list(model.classes_)
+            if predicted_category in classes:
+                features = vectorizer.transform([prompt])
+                class_index = classes.index(predicted_category)
+                coefficients = model.coef_[class_index]
+                feature_names = vectorizer.get_feature_names_out()
+                values = features.tocoo()
 
-        # Tokenise prompt into words (lowercase, alpha-only)
-        prompt_lower = prompt.lower()
-        prompt_tokens = set(re.findall(r"[a-z][a-z']{1,}", prompt_lower))
+                for feature_index, tfidf_value in zip(values.col, values.data):
+                    feature = feature_names[feature_index]
+                    contribution = float(tfidf_value * coefficients[feature_index])
+                    feature_words = _indicator_words(feature)
+                    if contribution > 0 and _meaningful_indicator(feature):
+                        if feature_words.issubset(prompt_token_set):
+                            display_words = [
+                                word for word in feature.split()
+                                if word.lower() not in INDICATOR_STOP_WORDS
+                            ]
+                            if display_words:
+                                candidates.append((" ".join(display_words), contribution))
+        except Exception:
+            candidates = []
 
-        # Find features that are both in the vocabulary and present in the prompt
-        present = {}
-        vocab = vectorizer.vocabulary_
+    # Prefer the strongest phrase, then retain non-overlapping meaningful terms.
+    candidates.sort(key=lambda item: (len(item[0].split()) > 1, item[1]), reverse=True)
+    indicators = []
+    used_words = set()
+    for feature, _ in candidates:
+        words = _indicator_words(feature)
+        if words & used_words:
+            continue
+        indicators.append(feature)
+        used_words.update(words)
+        if len(indicators) == 5:
+            return indicators
+
+    # Rule matches are useful fallback context, but only terms present in input
+    # are allowed through; no indicator is invented from a rule name.
+    if rule_match and rule_match.get("matched"):
+        pattern_words = _indicator_words(rule_match.get("pattern", ""))
         for token in prompt_tokens:
-            if token in vocab:
-                feat_idx = vocab[token]
-                coef = float(coefficients[feat_idx])
-                present[token] = coef
+            if token not in INDICATOR_STOP_WORDS and token in pattern_words and token not in used_words:
+                indicators.append(token)
+                used_words.add(token)
 
-        if not present:
-            return []
+    # Handle unseen words and prompts whose active features have no positive
+    # coefficient, while still excluding generic request language.
+    for token in prompt_tokens:
+        if token in INDICATOR_STOP_WORDS or token in used_words or len(token) < 3:
+            continue
+        indicators.append(token)
+        used_words.add(token)
+        if len(indicators) == 5:
+            break
 
-        # Return up to 5 words with the highest positive coefficients
-        top = sorted(present.items(), key=lambda x: x[1], reverse=True)
-        return [word for word, coef in top if coef > 0][:5]
-
-    except Exception:
-        # Never crash the main response due to explainability failure
-        return []
+    return indicators
 
 
 # --------------------------------------------------------------------
@@ -345,12 +426,10 @@ def generate_analysis_details(
 
     if rule_match.get("matched"):
         parts.append(
-            f"The security rule engine independently detected a high-risk pattern "
-            f"associated with {category}."
+            f"The security rule engine detected a contextual pattern associated with {category}."
         )
         parts.append(
-            "This means the prompt contained specific language commonly used in attempts "
-            "to manipulate or exploit AI systems."
+            "This means the request matched a contextual pattern associated with the selected security category."
         )
     else:
         parts.append(
@@ -364,8 +443,7 @@ def generate_analysis_details(
 
     category_context = {
         "Safe Prompt": (
-            "The prompt does not appear to contain language associated with known threat "
-            "categories and is considered safe for processing."
+            "The model did not detect a significant harmful or security-related intent."
         ),
         "Prompt Injection": (
             "Prompt injection attacks attempt to override or hijack the instructions "
@@ -384,8 +462,7 @@ def generate_analysis_details(
             "configuration details, or other sensitive data."
         ),
         "Unsafe Instructions": (
-            "The prompt requests instructions for actions that could cause real-world harm "
-            "or violate safety policies."
+            "The model detected language associated with harmful or dangerous intent."
         ),
     }
     ctx = category_context.get(category)
@@ -414,11 +491,11 @@ def get_analysis_methods() -> list:
 def generate_explanation(category: str, rule_match: dict) -> str:
     """Generate concise, user-friendly security explanations."""
     base_explanations = {
-        "Safe Prompt": "No significant malicious instruction pattern was detected.",
+        "Safe Prompt": "The model did not detect a significant harmful or security-related intent.",
         "Prompt Injection": "The prompt contains language that attempts to override or ignore previously established instructions.",
         "Jailbreak Attempts": "The prompt appears to attempt to bypass expected AI safety restrictions.",
         "Instruction Manipulation": "The prompt attempts to alter the priority or behavior of existing instructions.",
-        "Unsafe Instructions": "The prompt appears to request potentially harmful or unsafe actions.",
+        "Unsafe Instructions": "The model detected language associated with harmful or dangerous intent.",
         "Potential Data Leakage": "The prompt appears to request sensitive information, hidden instructions, credentials, or confidential configuration.",
     }
 
@@ -426,9 +503,8 @@ def generate_explanation(category: str, rule_match: dict) -> str:
         category, "The prompt triggered security policy boundaries."
     )
 
-    if rule_match.get("matched") and rule_match.get("pattern"):
-        pattern_str = rule_match["pattern"]
-        explanation += f" Security rule matched indicator: \"{pattern_str}\"."
+    if rule_match.get("matched"):
+        explanation += " A contextual security rule also matched this request."
 
     return explanation
 
@@ -498,6 +574,9 @@ def analyze():
     # Step 3: Combine Rule Match and ML Prediction
     if rule_match["matched"]:
         final_category = rule_match["category"]
+    elif not has_meaningful_prompt_content(cleaned_prompt):
+        # Do not infer harmful intent from an underspecified request.
+        final_category = "Safe Prompt"
     else:
         final_category = ml_pred
 
@@ -519,7 +598,7 @@ def analyze():
 
     # Step 7: Explainability extras
     security_indicator = get_security_indicator(final_category, rule_match)
-    top_indicators = get_top_indicators(cleaned_prompt, final_category)
+    top_indicators = get_top_indicators(cleaned_prompt, final_category, rule_match)
     analysis_methods = get_analysis_methods()
     analysis_details = generate_analysis_details(
         cleaned_prompt, final_category, confidence, rule_match
@@ -552,4 +631,4 @@ def analyze():
 load_models()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False, use_reloader=False)

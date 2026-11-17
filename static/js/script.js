@@ -141,8 +141,8 @@ function renderResult(data) {
 
   // Indicator tags
   const tagsHtml = topInd.length > 0
-    ? `<div class="indicator-tags">${topInd.map(w => `<span class="tag">${escapeHtml(w)}</span>`).join("")}</div>`
-    : `<span style="color:var(--text-muted); font-size:0.83rem;">No specific word-level indicators found</span>`;
+    ? `<div class="indicator-tags">${topInd.map(w => `<span class="tag">${escapeHtml(w)}</span>`).join("")}</div><div style="color:var(--text-muted); font-size:0.78rem; margin-top:6px;">Contributing textual features, not definitive proof of intent.</div>`
+    : `<span style="color:var(--text-muted); font-size:0.83rem;">No significant security indicator detected.</span>`;
 
   // Methods list
   const methodsHtml = methods.length > 0
@@ -153,7 +153,7 @@ function renderResult(data) {
   const indicatorColor = isSafe ? "var(--accent-green)" : "var(--accent-amber)";
   const indicatorHtml  = secInd
     ? `<div class="flagged-section-content" style="color:${indicatorColor}; font-weight:600;">${escapeHtml(secInd)}</div>`
-    : `<div class="flagged-section-content" style="color:var(--text-muted);">No explicit security indicator matched</div>`;
+    : `<div class="flagged-section-content" style="color:var(--text-muted);">No significant security indicator detected.</div>`;
 
   // Flagged panel title
   const flaggedTitle = isSafe
@@ -237,7 +237,7 @@ function renderResult(data) {
         ${indicatorHtml}
       </div>
       <div class="flagged-section">
-        <div class="flagged-section-label">Detected Word Indicators</div>
+        <div class="flagged-section-label">Contributing Textual Features</div>
         ${tagsHtml}
       </div>
       <div class="flagged-section">
